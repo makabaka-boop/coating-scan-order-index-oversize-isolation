@@ -224,6 +224,8 @@ describe('SeamStore：本地 JSON 入口（整文件契约验证，只取 readin
     const scheduler = new ManualScheduler();
     const store = new SeamStore(scheduler);
     await store.loadFileIntoSlot('left', 'f.json', () => Promise.resolve(fileText([1, 2, 3])));
+    // 解析续体经调度器排队：泵出后槽位才就绪
+    scheduler.runAll();
     expect(store.getState().left.status).toBe('ready');
     await store.loadFileIntoSlot('right', 'b.json', () => Promise.resolve(fileText([2, 3, 4])));
     scheduler.runAll();
@@ -237,6 +239,7 @@ describe('SeamStore：本地 JSON 入口（整文件契约验证，只取 readin
     const store = new SeamStore(scheduler);
     await store.loadFileIntoSlot('left', 'ok.json', () => Promise.resolve(fileText([1, 2, 3])));
     await store.loadFileIntoSlot('right', 'bad.json', () => Promise.resolve('{ not json'));
+    scheduler.runAll();
     const state = store.getState();
     expect(state.left.status).toBe('ready');
     expect(state.right.status).toBe('error');
@@ -252,6 +255,7 @@ describe('SeamStore：本地 JSON 入口（整文件契约验证，只取 readin
     await store.loadFileIntoSlot('left', 'r.json', () =>
       Promise.resolve(fileText([1, 2, 65536])),
     );
+    scheduler.runAll();
     let state = store.getState();
     expect(state.left.status).toBe('error');
     if (state.left.status === 'error') {
@@ -262,6 +266,7 @@ describe('SeamStore：本地 JSON 入口（整文件契约验证，只取 readin
     await store.loadFileIntoSlot('left', 'q.json', () =>
       Promise.resolve(fileText([1, 2, 3], [{ start: 0, end: 3, k: 4 }])),
     );
+    scheduler.runAll();
     state = store.getState();
     expect(state.left.status).toBe('error');
     if (state.left.status === 'error') {
@@ -276,6 +281,7 @@ describe('SeamStore：本地 JSON 入口（整文件契约验证，只取 readin
     await store.loadFileIntoSlot('left', 'io.json', () =>
       Promise.reject(new Error('磁盘错误')),
     );
+    scheduler.runAll();
     const state = store.getState();
     expect(state.left.status).toBe('error');
     if (state.left.status === 'error') {
@@ -298,11 +304,15 @@ describe('SeamStore：本地 JSON 入口（整文件契约验证，只取 readin
     await store.loadFileIntoSlot('left', 'fast.json', () =>
       Promise.resolve(fileText([7, 7, 7])),
     );
+    scheduler.runAll();
     expect(store.getState().left.status).toBe('ready');
 
-    // 迟到的第一次读取此时才兑现：必须被忽略
+    // 迟到的第一次读取此时才兑现：其解析续体入队后在下一调度点自行终止
     slow.resolve(fileText([1, 1, 1]));
     await first;
+    // 续体已在队列中但尚未执行：当前状态不受影响
+    expect(store.getState().left.status).toBe('ready');
+    scheduler.runAll();
     const state = store.getState();
     expect(state.left.status).toBe('ready');
     if (state.left.status === 'ready') {

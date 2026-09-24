@@ -11,9 +11,47 @@ export interface ValidInput {
   queries: Query[];
 }
 
+/**
+ * 单份文件最多保留的逐条错误数。
+ * 被拒绝文件只能产生有界且可定位的错误摘要：超过该数量后不再逐条积累，
+ * 仅追加一条截断说明，保证诊断规模不随输入长度线性增长。
+ */
+export const MAX_VALIDATION_ERRORS = 50;
+
 type ValidationOutcome =
   | { ok: true; input: ValidInput; errors: [] }
   | { ok: false; input: null; errors: string[] };
+
+/**
+ * 有界错误收集器：
+ * - 逐条错误至多保留 MAX_VALIDATION_ERRORS 条（每条都带数组下标，可定位）；
+ * - 超出部分只计数，最终折叠成单条截断摘要，错误总数恒为 ≤ 上限 + 1；
+ * - 调用方只需照常 push，收集器保证字符串积累不随输入长度增长。
+ */
+class BoundedErrors {
+  private readonly kept: string[] = [];
+  private omitted = 0;
+
+  push(message: string): void {
+    if (this.kept.length < MAX_VALIDATION_ERRORS) {
+      this.kept.push(message);
+    } else {
+      this.omitted++;
+    }
+  }
+
+  get hasErrors(): boolean {
+    return this.kept.length > 0;
+  }
+
+  finish(): string[] {
+    if (this.omitted === 0) return this.kept.slice();
+    return [
+      ...this.kept,
+      `错误过多：另有 ${this.omitted} 条同类错误未逐条列出（单份文件至多展示 ${MAX_VALIDATION_ERRORS} 条下标诊断）`,
+    ];
+  }
+}
 
 /**
  * 严格校验载入的 JSON：
@@ -21,10 +59,13 @@ type ValidationOutcome =
  * - readings 长度 1..200000，每个元素必须是 0..65535 的整数；
  * - queries 长度 0..100000，每个查询必须恰好含 start/end/k 三个整数键，
  *   满足 0≤start<end≤readings.length 且 1≤k≤end-start；
- * - 任何结构或边界错误都拒绝整个文件，错误按数组下标反馈。
+ * - 任何结构或边界错误都拒绝整个文件，错误按数组下标反馈；
+ * - 超过契约规模的数组不再逐元素遍历（结构错误本身即可拒绝），
+ *   合法规模内的逐条错误也有统一上限（前 50 条可定位，其余折叠为单条摘要），
+ *   渲染量与错误字符串总量均不随输入长度线性增长。
  */
 export function validateInput(data: unknown): ValidationOutcome {
-  const errors: string[] = [];
+  const errors = new BoundedErrors();
 
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
     return {
@@ -53,16 +94,20 @@ export function validateInput(data: unknown): ValidationOutcome {
     if (readingsLength < 1) {
       errors.push('readings[*]：数组至少包含 1 条读数，当前长度为 0');
     } else if (readingsLength > READINGS_MAX) {
+      // 超过契约规模即整体拒绝：不再逐元素遍历，
+      // 避免 O(输入长度) 的主线程占用与线性增长的诊断
       errors.push(`readings[*]：数组长度 ${readingsLength} 超出上限 ${READINGS_MAX}`);
     } else {
       lengthUsable = true;
-    }
-    for (let i = 0; i < rawReadings.length; i++) {
-      const v = rawReadings[i];
-      if (typeof v !== 'number' || !Number.isInteger(v)) {
-        errors.push(`readings[${i}]：必须是整数，当前为 ${describeValue(v)}`);
-      } else if (v < VALUE_MIN || v > VALUE_MAX) {
-        errors.push(`readings[${i}]：值 ${v} 越界，允许范围为 ${VALUE_MIN}..${VALUE_MAX}`);
+      // 数组长度合法（≤ READINGS_MAX）：全量遍历是校验契约的本来成本，
+      // 诊断积累由收集器封顶，错误字符串不再随错误数量线性增长
+      for (let i = 0; i < rawReadings.length; i++) {
+        const v = rawReadings[i];
+        if (typeof v !== 'number' || !Number.isInteger(v)) {
+          errors.push(`readings[${i}]：必须是整数，当前为 ${describeValue(v)}`);
+        } else if (v < VALUE_MIN || v > VALUE_MAX) {
+          errors.push(`readings[${i}]：值 ${v} 越界，允许范围为 ${VALUE_MIN}..${VALUE_MAX}`);
+        }
       }
     }
   }
@@ -71,6 +116,7 @@ export function validateInput(data: unknown): ValidationOutcome {
   if (!Array.isArray(rawQueries)) {
     errors.push('queries 必须是查询对象数组');
   } else if (rawQueries.length > QUERIES_MAX) {
+    // 同样不在超长 queries 上做逐元素遍历
     errors.push(`queries[*]：数组长度 ${rawQueries.length} 超出上限 ${QUERIES_MAX}`);
   } else {
     for (let i = 0; i < rawQueries.length; i++) {
@@ -122,8 +168,8 @@ export function validateInput(data: unknown): ValidationOutcome {
     }
   }
 
-  if (errors.length > 0) {
-    return { ok: false, input: null, errors };
+  if (errors.hasErrors) {
+    return { ok: false, input: null, errors: errors.finish() };
   }
 
   return {
@@ -143,7 +189,7 @@ function integerField(
   qo: Record<string, unknown>,
   name: 'start' | 'end' | 'k',
   index: number,
-  errors: string[],
+  errors: BoundedErrors,
 ): number | null {
   if (!(name in qo)) {
     errors.push(`queries[${index}]：缺少字段 "${name}"`);

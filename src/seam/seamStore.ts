@@ -1,4 +1,5 @@
 import { validateInput } from '../validation';
+import { MAX_FILE_BYTES, QUERIES_MAX, READINGS_MAX, formatByteSize } from '../types';
 import {
   CONTEXT_MAX,
   createSeamMatcher,
@@ -11,10 +12,15 @@ import {
  *
  * 关键不变量：
  * - 每个槽位独立经历 空 → 读取中 → 就绪 / 错误；单侧失败只标记该槽，另一侧原样保留；
- * - 任何槽位变动都立即撤销旧结论（result 置空）并作废在途匹配任务；
+ * - 任何槽位变动都立即撤销旧结论（result 置空）并作废在途任务（匹配与读取/解析都包括）；
  * - 匹配任务以「双侧版本身份」绑定：任务令牌记录启动时的 leftVersion / rightVersion
  *   与唯一 taskId，只有三者仍与当前一致才允许推进或提交；
- * - 旧任务被作废后不会立刻被清除，而是在下一个调度点（分片入口）自行终止；
+ * - 读取完成后的 JSON 解析与契约校验同样经由调度器排队，并在执行入口核验槽位版本：
+ *   槽位被替换后，旧文件的解析续体在下一调度点自行终止——不 parse、不校验、
+ *   也不入队后续工作，新文件不再被已作废的大文件拖住；
+ * - 超过 MAX_FILE_BYTES 的文件在读取前直接拒绝（有界单条诊断），不把超限文本读入内存；
+ *   校验产生的逐条错误也由 validateInput 统一封顶，不随输入长度线性增长；
+ * - 旧任务被作废后不会立刻被清除，而是在下一个调度点（分片/续体入口）自行终止；
  *   其晚到的完成回调在提交前再次核验身份，绝不能覆盖当前状态；
  * - 分片经由 Scheduler 让出，界面在匹配期间仍可继续选择文件。
  */
@@ -177,15 +183,39 @@ export class SeamStore {
   }
 
   /**
-   * 本地 JSON 入口：读取文件文本 → JSON.parse → 按 readings/queries 契约整体验证。
+   * 本地 JSON 入口：
+   * 1. beginSlot 立即作废该槽一切在途任务并进入读取中；
+   * 2. 已知字节数超 MAX_FILE_BYTES 时读取前直接拒绝，不读入超限文本；
+   * 3. 读取文本；读取失败只标记该槽；
+   * 4. 把 JSON.parse + 契约整体验证排入调度器：
+   *    续体执行时若槽位版本已变化（读取期间被新文件替换），旧续体自行终止，
+   *    不再占用主线程，也绝不 fail/ready 当前槽位或改变另一侧；
+   *    晚到的读取回调同理——续体只在执行入口核验一次身份即可（排队期间不会变化）。
    * 本模块只取用 readings，不调用查询分析；queries 非法同样导致整个文件被拒。
+   *
+   * 返回的 Promise 在「解析续体入队后」兑现，随后必须由调度器泵出才会改状态，
+   * 与匹配分片使用同一个调度点机制（浏览器 setTimeout / 测试手动队列）。
    */
   async loadFileIntoSlot(
     side: SlotSide,
     fileName: string,
     readText: () => Promise<string>,
+    options?: { byteSize?: number; parseText?: (text: string) => unknown },
   ): Promise<void> {
     const ticket = this.beginSlot(side, fileName);
+
+    // 读取前规模闸门：超限文件不进入文件读取，诊断有界且可定位
+    if (options?.byteSize !== undefined && options.byteSize > MAX_FILE_BYTES) {
+      this.failSlot(
+        side,
+        fileName,
+        [
+          `文件过大：${formatByteSize(options.byteSize)} 超出 ${formatByteSize(MAX_FILE_BYTES)} 上限，读取前拒绝（契约：${READINGS_MAX} 条读数 / ${QUERIES_MAX} 条查询）`,
+        ],
+        ticket,
+      );
+      return;
+    }
 
     let text: string;
     try {
@@ -195,20 +225,27 @@ export class SeamStore {
       return;
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      this.failSlot(side, fileName, [`JSON 语法错误，整个文件被拒绝：${errorMessage(e)}`], ticket);
-      return;
-    }
+    // 解析/校验续体经调度器排队：槽位在此期间被替换时，旧续体在执行入口
+    // 发现 ticket 过期便自行终止，不再 parse/校验，也不入队任何后续工作。
+    const parseText = options?.parseText ?? JSON.parse;
+    this.scheduler.schedule(() => {
+      if (ticket !== this.versionOf(side)) return;
 
-    const verdict = validateInput(parsed);
-    if (!verdict.ok) {
-      this.failSlot(side, fileName, verdict.errors, ticket);
-      return;
-    }
-    this.readySlot(side, fileName, verdict.input.readings, ticket);
+      let parsed: unknown;
+      try {
+        parsed = parseText(text);
+      } catch (e) {
+        this.failSlot(side, fileName, [`JSON 语法错误，整个文件被拒绝：${errorMessage(e)}`], ticket);
+        return;
+      }
+
+      const verdict = validateInput(parsed);
+      if (!verdict.ok) {
+        this.failSlot(side, fileName, verdict.errors, ticket);
+        return;
+      }
+      this.readySlot(side, fileName, verdict.input.readings, ticket);
+    });
   }
 
   private versionOf(side: SlotSide): number {

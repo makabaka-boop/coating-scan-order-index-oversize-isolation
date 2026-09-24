@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { analyze } from './analyze';
 import { generateFullScale } from './sampleGenerator';
+import { MAX_FILE_BYTES, formatByteSize } from './types';
 import type { AnalysisResult, Query } from './types';
 
 interface LoadedPayload {
@@ -49,6 +50,17 @@ export function KthReview() {
     async (file: File) => {
       // 先清除旧结果（含上一份成功答案），再进入新文件处理
       setView({ status: 'busy', fileName: file.name });
+      // 读取前规模闸门：超限文件不读入内存，诊断有界
+      if (file.size > MAX_FILE_BYTES) {
+        setView({
+          status: 'error',
+          fileName: file.name,
+          errors: [
+            `文件过大：${formatByteSize(file.size)} 超出 ${formatByteSize(MAX_FILE_BYTES)} 上限，读取前拒绝`,
+          ],
+        });
+        return;
+      }
       try {
         const text = await file.text();
         let parsed: unknown;

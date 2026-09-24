@@ -16,8 +16,10 @@ const SIDE_META: Array<{ side: SlotSide; label: string; role: string }> = [
  * 扫描片段接缝视图。关键不变量：
  * - 文件按 readings/queries 契约整体验证，本模块只读取 readings，
  *   不调用查询分析，也不渲染既有结果表；
- * - 匹配在分片调度中后台推进，任何时刻都可以替换任一槽位；
- *   替换立即撤销旧结论，旧任务的晚到回调不会污染界面。
+ * - 超过字节上限的文件读取前拒绝；校验错误有统一上限（可定位摘要），
+ *   界面永远只渲染有界数量的错误行；
+ * - 读取后的解析/校验与匹配都在调度点上推进并核验槽位版本，任何时刻都可以
+ *   替换任一槽位；替换立即撤销旧结论，旧续体/旧任务的晚到回调不会污染界面。
  */
 export function SeamView() {
   const [store] = useState(() => new SeamStore(createTimeoutScheduler()));
@@ -27,7 +29,7 @@ export function SeamView() {
 
   const pick = useCallback(
     (side: SlotSide, file: File) => {
-      void store.loadFileIntoSlot(side, file.name, () => file.text());
+      void store.loadFileIntoSlot(side, file.name, () => file.text(), { byteSize: file.size });
     },
     [store],
   );
