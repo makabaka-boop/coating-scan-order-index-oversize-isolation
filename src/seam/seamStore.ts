@@ -1,4 +1,4 @@
-import { validateInput } from '../validation';
+import { textSizeError, validateInput } from '../validation';
 import {
   CONTEXT_MAX,
   createSeamMatcher,
@@ -12,11 +12,17 @@ import {
  * 关键不变量：
  * - 每个槽位独立经历 空 → 读取中 → 就绪 / 错误；单侧失败只标记该槽，另一侧原样保留；
  * - 任何槽位变动都立即撤销旧结论（result 置空）并作废在途匹配任务；
+ * - 前置管线（读取 → 解析 → 校验）与匹配任务一样具备分片与任务身份保护：
+ *   解析、校验各为独立调度分片，分片入口核验槽位版本（ticket）；
+ *   槽位被替换后，旧任务在下一调度点自行终止——不再解析、不再校验，
+ *   被替换的大文件不会继续占用主线程而延迟当前文件；
+ * - 远超契约规模的文件在读取前（已知字节数）或解析前（已知字符数）即被拒绝，
+ *   被拒文件只产生有界且可定位的错误摘要（见 validation.ts 的 ERROR_CAP）；
  * - 匹配任务以「双侧版本身份」绑定：任务令牌记录启动时的 leftVersion / rightVersion
  *   与唯一 taskId，只有三者仍与当前一致才允许推进或提交；
  * - 旧任务被作废后不会立刻被清除，而是在下一个调度点（分片入口）自行终止；
  *   其晚到的完成回调在提交前再次核验身份，绝不能覆盖当前状态；
- * - 分片经由 Scheduler 让出，界面在匹配期间仍可继续选择文件。
+ * - 分片经由 Scheduler 让出，界面在读取、校验与匹配期间仍可继续选择文件。
  */
 
 export type SlotSide = 'left' | 'right';
@@ -119,6 +125,15 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** loadFileIntoSlot 的可选参数 */
+export interface LoadFileOptions {
+  /**
+   * 已知的文件字节数（如 File.size）。超过契约文本规模上限时在读取前
+   * 直接拒绝：不读取、不解析、不校验，诊断恰好一条。
+   */
+  byteSize?: number;
+}
+
 export class SeamStore {
   private leftSlot: SlotState = { status: 'empty' };
   private rightSlot: SlotState = { status: 'empty' };
@@ -179,13 +194,28 @@ export class SeamStore {
   /**
    * 本地 JSON 入口：读取文件文本 → JSON.parse → 按 readings/queries 契约整体验证。
    * 本模块只取用 readings，不调用查询分析；queries 非法同样导致整个文件被拒。
+   *
+   * 前置管线与匹配任务一样具备分片与任务身份保护：
+   * - 已知字节数且远超契约规模时，不读取即整体拒绝（有界诊断：恰好一条）；
+   * - 解析、校验各为独立调度分片，分片入口核验槽位版本（ticket）；
+   *   槽位被替换后，旧任务在下一调度点自行终止，不再解析、不再校验，
+   *   不会继续占用主线程而延迟当前文件，也不会触碰另一槽位与最近合法结果；
+   * - 校验本身有界（超限短路 + ERROR_CAP），单个分片的耗时随之有界。
    */
   async loadFileIntoSlot(
     side: SlotSide,
     fileName: string,
     readText: () => Promise<string>,
+    options: LoadFileOptions = {},
   ): Promise<void> {
     const ticket = this.beginSlot(side, fileName);
+
+    // 规模预检：远超契约规模的文件连读取都不启动
+    const oversize = options.byteSize === undefined ? null : textSizeError(options.byteSize);
+    if (oversize !== null) {
+      this.failSlot(side, fileName, [oversize], ticket);
+      return;
+    }
 
     let text: string;
     try {
@@ -195,20 +225,36 @@ export class SeamStore {
       return;
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      this.failSlot(side, fileName, [`JSON 语法错误，整个文件被拒绝：${errorMessage(e)}`], ticket);
-      return;
-    }
+    // 解析分片：读取完成后经调度器让出，入口核验任务身份
+    this.scheduler.schedule(() => {
+      if (ticket !== this.versionOf(side)) return; // 调度点：任务已作废，自行终止
 
-    const verdict = validateInput(parsed);
-    if (!verdict.ok) {
-      this.failSlot(side, fileName, verdict.errors, ticket);
-      return;
-    }
-    this.readySlot(side, fileName, verdict.input.readings, ticket);
+      // 字符数预检：拦截未提供字节数入口的远超规模文本，避免巨型 JSON.parse 长阻塞
+      const oversizeText = textSizeError(text.length);
+      if (oversizeText !== null) {
+        this.failSlot(side, fileName, [oversizeText], ticket);
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch (e) {
+        this.failSlot(side, fileName, [`JSON 语法错误，整个文件被拒绝：${errorMessage(e)}`], ticket);
+        return;
+      }
+
+      // 校验分片：再次让出并核验身份；validateInput 的诊断与耗时均有界
+      this.scheduler.schedule(() => {
+        if (ticket !== this.versionOf(side)) return; // 调度点：任务已作废，自行终止
+        const verdict = validateInput(parsed);
+        if (!verdict.ok) {
+          this.failSlot(side, fileName, verdict.errors, ticket);
+          return;
+        }
+        this.readySlot(side, fileName, verdict.input.readings, ticket);
+      });
+    });
   }
 
   private versionOf(side: SlotSide): number {

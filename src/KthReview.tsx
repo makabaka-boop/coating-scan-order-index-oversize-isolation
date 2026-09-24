@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { analyze } from './analyze';
 import { generateFullScale } from './sampleGenerator';
+import { textSizeError } from './validation';
 import type { AnalysisResult, Query } from './types';
 
 interface LoadedPayload {
@@ -16,15 +17,23 @@ type ViewState =
   | { status: 'error'; fileName: string; errors: string[] }
   | { status: 'ready'; payload: LoadedPayload };
 
+/** 错误列表的渲染上限：校验层已保证诊断有界，这里再做一道防御性截断 */
+const RENDERED_ERRORS_MAX = 50;
+
 /**
  * 第 k 小复核台。关键不变量：
  * - 每次重新选文件/载入样本都先清空旧视图，再处理新内容；
- * - 只有全部校验通过才渲染答案，任何非法文件只显示错误、绝不留下部分答案；
+ * - 读取以单调递增的 loadSeq 绑定身份，读取期间被更新的选择替换时，
+ *   旧任务的晚到回调（含解析与分析结果）一律丢弃，不覆盖当前状态；
+ * - 远超契约规模的文件在读取前 / 解析前直接拒绝，不进入同步解析；
+ * - 只有全部校验通过才渲染答案，任何非法文件只显示有界错误摘要、绝不留下部分答案；
  * - 答案按 queries 原顺序一一对应展示，显式打印查询下标，杜绝相邻窗口错位。
  */
 export function KthReview() {
   const [view, setView] = useState<ViewState>({ status: 'idle' });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 当前选择序号：每次选文件 / 载入样本单调递增，旧加载任务以此作废 */
+  const loadSeq = useRef(0);
 
   const consumeObject = useCallback((obj: unknown, fileName: string) => {
     // analyze 内部保证：失败时 answers 为空，调用方据此清除旧结果
@@ -47,14 +56,30 @@ export function KthReview() {
 
   const handleFile = useCallback(
     async (file: File) => {
+      const seq = ++loadSeq.current;
       // 先清除旧结果（含上一份成功答案），再进入新文件处理
       setView({ status: 'busy', fileName: file.name });
+      // 规模预检：远超契约规模的文件不读取即整体拒绝（诊断恰好一条）
+      const oversize = textSizeError(file.size);
+      if (oversize) {
+        setView({ status: 'error', fileName: file.name, errors: [oversize] });
+        return;
+      }
       try {
         const text = await file.text();
+        // 读取期间用户可能已改选：旧任务的晚到结果不得覆盖当前状态
+        if (seq !== loadSeq.current) return;
+        // 字符数预检：在同步 JSON.parse 之前拦截巨型文本
+        const oversizeText = textSizeError(text.length);
+        if (oversizeText) {
+          setView({ status: 'error', fileName: file.name, errors: [oversizeText] });
+          return;
+        }
         let parsed: unknown;
         try {
           parsed = JSON.parse(text);
         } catch (e) {
+          if (seq !== loadSeq.current) return;
           const msg = e instanceof Error ? e.message : String(e);
           setView({
             status: 'error',
@@ -63,8 +88,10 @@ export function KthReview() {
           });
           return;
         }
+        if (seq !== loadSeq.current) return;
         consumeObject(parsed, file.name);
       } catch (e) {
+        if (seq !== loadSeq.current) return;
         const msg = e instanceof Error ? e.message : String(e);
         setView({ status: 'error', fileName: file.name, errors: [`文件读取失败：${msg}`] });
       }
@@ -83,9 +110,11 @@ export function KthReview() {
   );
 
   const loadFullScaleSample = useCallback(() => {
+    const seq = ++loadSeq.current;
     setView({ status: 'busy', fileName: '内置满规模样本（200000 读数 / 100000 查询）' });
     // 让 busy 有机会绘制后再做重计算
     setTimeout(() => {
+      if (seq !== loadSeq.current) return; // 等待期间已被文件选择替换
       const sample = generateFullScale();
       consumeObject(sample, '内置满规模样本（200000 读数 / 100000 查询）');
     }, 16);
@@ -119,10 +148,15 @@ export function KthReview() {
             以下结构或边界错误导致整个文件被拒，未产生任何查询答案；如之前有旧结果也已清除。
           </p>
           <ul className="error-list">
-            {view.errors.map((msg, i) => (
+            {view.errors.slice(0, RENDERED_ERRORS_MAX).map((msg, i) => (
               <li key={i}>{msg}</li>
             ))}
           </ul>
+          {view.errors.length > RENDERED_ERRORS_MAX && (
+            <p className="hint">
+              错误过多：仅展示前 {RENDERED_ERRORS_MAX} 条（共 {view.errors.length} 条）
+            </p>
+          )}
         </section>
       )}
 

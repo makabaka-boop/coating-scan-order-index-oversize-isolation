@@ -16,8 +16,9 @@ const SIDE_META: Array<{ side: SlotSide; label: string; role: string }> = [
  * 扫描片段接缝视图。关键不变量：
  * - 文件按 readings/queries 契约整体验证，本模块只读取 readings，
  *   不调用查询分析，也不渲染既有结果表；
- * - 匹配在分片调度中后台推进，任何时刻都可以替换任一槽位；
- *   替换立即撤销旧结论，旧任务的晚到回调不会污染界面。
+ * - 读取、解析、校验与匹配都在分片调度中推进，任何时刻都可以替换任一槽位；
+ *   替换立即撤销旧结论，旧任务在下一调度点自行终止，晚到回调不会污染界面；
+ * - 被拒文件的错误摘要有界，渲染条数同样有上限，界面不会因病态输入失控。
  */
 export function SeamView() {
   const [store] = useState(() => new SeamStore(createTimeoutScheduler()));
@@ -27,7 +28,8 @@ export function SeamView() {
 
   const pick = useCallback(
     (side: SlotSide, file: File) => {
-      void store.loadFileIntoSlot(side, file.name, () => file.text());
+      // 传入字节数：远超契约规模的文件不读取即被拒绝
+      void store.loadFileIntoSlot(side, file.name, () => file.text(), { byteSize: file.size });
     },
     [store],
   );
@@ -52,6 +54,9 @@ export function SeamView() {
     </section>
   );
 }
+
+/** 错误列表的渲染上限：校验层已保证诊断有界，这里再做一道防御性截断 */
+const RENDERED_ERRORS_MAX = 50;
 
 function SlotCard({
   label,
@@ -108,10 +113,15 @@ function SlotCard({
               「{slot.fileName}」被整体拒绝（仅标记本槽位，另一槽位保留）：
             </p>
             <ul className="error-list">
-              {slot.errors.map((msg, i) => (
+              {slot.errors.slice(0, RENDERED_ERRORS_MAX).map((msg, i) => (
                 <li key={i}>{msg}</li>
               ))}
             </ul>
+            {slot.errors.length > RENDERED_ERRORS_MAX && (
+              <p className="hint">
+                错误过多：仅展示前 {RENDERED_ERRORS_MAX} 条（共 {slot.errors.length} 条）
+              </p>
+            )}
           </div>
         )}
       </div>

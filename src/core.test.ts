@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { WaveletMatrix } from './waveletMatrix';
 import { kthBySort } from './oracle';
-import { validateInput } from './validation';
+import { ERROR_CAP, textSizeError, validateInput } from './validation';
 import { analyze } from './analyze';
+import { TEXT_MAX } from './types';
 
 /** 对所有合法 [start,end) 与所有 1≤k≤len 的小数据穷举比对 */
 function exhaustivelyCompare(readings: number[]) {
@@ -190,5 +191,110 @@ describe('validateInput：任何结构或边界错误都整体拒绝', () => {
     expect(result.answers).toEqual([]);
     expect(result.queryCount).toBe(0);
     expect(result.errors.length).toBeGreaterThan(0);
+  });
+});
+
+describe('validateInput：被拒文件的错误摘要有界且可定位', () => {
+  it('readings 超长：即使每个元素都非法也只报 1 条规模错误（短路，不逐元素扫描）', () => {
+    // 50 万个越界值：修复前会产生 50 万条诊断并遍历全部元素
+    const verdict = validateInput({ readings: new Array(500_000).fill(-1), queries: [] });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok === false) {
+      expect(verdict.errors).toHaveLength(1);
+      expect(verdict.errors[0]).toContain('超出上限');
+      expect(verdict.errors[0]).toContain('逐元素校验已跳过');
+    }
+  });
+
+  it('queries 超长：只报 1 条规模错误（短路，不逐元素扫描）', () => {
+    const verdict = validateInput({
+      readings: [1, 2, 3],
+      queries: new Array(300_000).fill(null),
+    });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok === false) {
+      expect(verdict.errors).toHaveLength(1);
+      expect(verdict.errors[0]).toContain('超出上限');
+      expect(verdict.errors[0]).toContain('逐元素校验已跳过');
+    }
+  });
+
+  it('readings 与 queries 同时超长：总共只有 2 条诊断', () => {
+    const verdict = validateInput({
+      readings: new Array(500_000).fill(-1),
+      queries: new Array(300_000).fill({ start: 0, end: 1, k: 1 }),
+    });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok === false) {
+      expect(verdict.errors).toHaveLength(2);
+      expect(verdict.errors.join('\n')).toContain('readings[*]');
+      expect(verdict.errors.join('\n')).toContain('queries[*]');
+    }
+  });
+
+  it('规模合规但大量非法读数：诊断封顶为 ERROR_CAP 条定位 + 1 条截断汇总', () => {
+    const verdict = validateInput({ readings: new Array(100_000).fill(-1), queries: [] });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok === false) {
+      expect(verdict.errors).toHaveLength(ERROR_CAP + 1);
+      // 逐条诊断仍可按下标定位：前 32 条分别对应 readings[0]..readings[31]
+      expect(verdict.errors[0]).toContain('readings[0]');
+      expect(verdict.errors[ERROR_CAP - 1]).toContain(`readings[${ERROR_CAP - 1}]`);
+      // 第 33 条是截断汇总，而不是 readings[32]
+      expect(verdict.errors[ERROR_CAP]).toContain('错误过多');
+      expect(verdict.errors[ERROR_CAP]).not.toContain('readings[32]');
+    }
+  });
+
+  it('大量非法查询同样封顶，且每条保留 queries[i] 定位', () => {
+    const queries = new Array(100_000).fill(null);
+    const verdict = validateInput({ readings: [1, 2, 3], queries });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok === false) {
+      expect(verdict.errors).toHaveLength(ERROR_CAP + 1);
+      expect(verdict.errors[0]).toContain('queries[0]');
+      expect(verdict.errors[ERROR_CAP - 1]).toContain(`queries[${ERROR_CAP - 1}]`);
+      expect(verdict.errors[ERROR_CAP]).toContain('错误过多');
+    }
+  });
+
+  it('诊断量与输入长度无关：10 万与 199999 条非法读数产生相同的有界摘要', () => {
+    const a = validateInput({ readings: new Array(100_000).fill(65536), queries: [] });
+    const b = validateInput({ readings: new Array(199_999).fill(65536), queries: [] });
+    expect(a.ok).toBe(false);
+    expect(b.ok).toBe(false);
+    if (a.ok === false && b.ok === false) {
+      expect(a.errors.length).toBe(ERROR_CAP + 1);
+      expect(b.errors.length).toBe(ERROR_CAP + 1);
+    }
+  });
+
+  it('规模合规且错误数不超过上限时行为不变：全部错误仍逐条列出', () => {
+    const verdict = validateInput({
+      readings: [0, -1, 65536],
+      queries: [
+        { start: 0, end: 1, k: 1 },
+        { start: 0, end: 9, k: 1 },
+        { start: 0, end: 1, k: 2 },
+      ],
+    });
+    if (verdict.ok === false) {
+      expect(verdict.errors).toHaveLength(4);
+      const text = verdict.errors.join('\n');
+      expect(text).toContain('readings[1]');
+      expect(text).toContain('readings[2]');
+      expect(text).toContain('queries[1]');
+      expect(text).toContain('queries[2]');
+    } else {
+      throw new Error('应当整体拒绝');
+    }
+  });
+
+  it('文本规模预检：超过 TEXT_MAX 返回一条诊断，边界值恰好放行', () => {
+    expect(textSizeError(TEXT_MAX)).toBeNull();
+    expect(textSizeError(0)).toBeNull();
+    const msg = textSizeError(TEXT_MAX + 1);
+    expect(msg).not.toBeNull();
+    expect(msg).toContain('超出契约文本规模上限');
   });
 });
